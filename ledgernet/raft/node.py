@@ -1,4 +1,4 @@
-"""RaftNode: leader election with heartbeats (owned by P).
+"""RaftNode: leader election, log replication, commit, apply and client futures (owned by P).
 
 Everything runs on one asyncio event loop and never awaits while a critical section is half done:
 store and state-machine calls are synchronous, and the only awaits are transport calls and sleeps.
@@ -14,10 +14,11 @@ import asyncio
 import logging
 import random
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
 from ledgernet.common import events
-from ledgernet.common.errors import TransportError
+from ledgernet.common.errors import LeadershipLostError, NotLeaderError, TransportError
 from ledgernet.common.interfaces import (
     Consensus,
     LogStore,
@@ -47,6 +48,8 @@ FOLLOWER = "follower"
 CANDIDATE = "candidate"
 LEADER = "leader"
 
+APPLY_BATCH_SIZE = 100  # entries applied between yields to the event loop
+RESULT_CACHE_SIZE = 10_000  # recent ApplyResults kept for wait_for_apply
 
 logger = logging.getLogger("ledgernet.raft")
 
@@ -108,15 +111,22 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._election_task: asyncio.Task | None = None
         self._replication_tasks: dict[NodeId, asyncio.Task] = {}
         self._replication_kick: dict[NodeId, asyncio.Event] = {}
+        self._apply_wakeup: asyncio.Event | None = None
+
+        # Client futures for wait_for_apply.
+        self._waiters: dict[int, list[tuple[int, asyncio.Future]]] = {}
+        self._results: OrderedDict[int, ApplyResult] = OrderedDict()
 
     # ------------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
         self._recover()
+        self._apply_wakeup = asyncio.Event()
         self._stopped = False
         self._reset_election_deadline()
         await self._transport.start(self)
         self._spawn(self._ticker_loop(), "ticker")
+        self._spawn(self._apply_loop(), "applier")
         await asyncio.sleep(0)  # let the background tasks start, so an immediate stop() cancels them cleanly
 
     async def stop(self) -> None:
@@ -130,15 +140,42 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._tasks.clear()
         self._replication_tasks.clear()
         self._election_task = None
+        for futures in self._waiters.values():
+            for _, future in futures:
+                if not future.done():
+                    future.set_exception(LeadershipLostError("node stopped"))
+        self._waiters.clear()
         await self._transport.stop()
 
     # ------------------------------------------------------------------ Consensus API
 
     async def propose(self, command: bytes) -> tuple[int, int]:
-        raise NotImplementedError("log replication is added in the next step")
+        if self._role != LEADER or self._stopped:
+            raise NotLeaderError(self._leader_id)
+        index = self._store.last_index() + 1
+        term = self._term
+        self._store.append([LogEntry(index, term, command)])  # durable before we count ourselves
+        self._kick_replication()
+        self._advance_commit()  # matters for a single-node cluster
+        return index, term
 
     async def wait_for_apply(self, index: int, term: int, timeout: float) -> ApplyResult:
-        raise NotImplementedError("the apply loop is added in the next step")
+        cached = self._results.get(index)
+        if cached is not None:
+            return self._check_result_term(cached, term)
+        if self._sm.last_applied() >= index:
+            # Applied long ago (evicted from the cache) or skipped by a snapshot: the result is gone.
+            raise LeadershipLostError(f"result for index {index} is no longer available")
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._waiters.setdefault(index, []).append((term, future))
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            remaining = [w for w in self._waiters.get(index, []) if w[1] is not future]
+            if remaining:
+                self._waiters[index] = remaining
+            else:
+                self._waiters.pop(index, None)
 
     def status(self) -> RaftStatus:
         return RaftStatus(
@@ -210,6 +247,11 @@ class RaftNode(Consensus, RaftRpcHandler):
         my_index, my_term = self._last_log()
         return (last_term, last_index) >= (my_term, my_index)
 
+    def _check_result_term(self, result: ApplyResult, term: int) -> ApplyResult:
+        if result.term != term:
+            raise LeadershipLostError(f"entry {result.index} was committed in term {result.term}, not {term}")
+        return result
+
     async def _rpc(self, awaitable: Awaitable, timeout_s: float):
         try:
             return await asyncio.wait_for(awaitable, timeout_s)
@@ -246,6 +288,7 @@ class RaftNode(Consensus, RaftRpcHandler):
         if self.on_leader_elected is not None:
             self.on_leader_elected(self)
         self._start_replication()
+        self._advance_commit()
 
     # ------------------------------------------------------------------ ticker and elections
 
@@ -329,12 +372,57 @@ class RaftNode(Consensus, RaftRpcHandler):
     # ------------------------------------------------------------------ AppendEntries handler
 
     async def on_append_entries(self, req: AppendEntriesRequest) -> AppendEntriesResponse:
-        """Heartbeat handling only: accept the leader and reset the election timer."""
         if req.term < self._term:
             return AppendEntriesResponse(self._term, False)
         self._become_follower(req.term, req.leader_id)
         self._note_leader_contact(req.leader_id)
-        return AppendEntriesResponse(self._term, True)
+
+        prev_index, entries = req.prev_log_index, list(req.entries)
+        snapshot_index = self._store.snapshot_index()
+        if prev_index < snapshot_index:
+            # The part before our snapshot is committed and therefore identical to the leader's.
+            entries = [e for e in entries if e.index > snapshot_index]
+            prev_index = snapshot_index
+        else:
+            last_index = self._store.last_index()
+            if prev_index > last_index:
+                return AppendEntriesResponse(
+                    self._term, False, conflict_index=last_index + 1, conflict_term=0
+                )
+            local_term = self._store.term_at(prev_index)
+            if local_term != req.prev_log_term:
+                return self._conflict_response(prev_index, local_term or 0)
+
+        self._merge_entries(prev_index, entries)
+        last_new = req.prev_log_index + len(req.entries)
+        if req.leader_commit > self._commit_index:
+            self._set_commit(max(self._commit_index, min(req.leader_commit, last_new)))
+        return AppendEntriesResponse(self._term, True, match_index=last_new)
+
+    def _conflict_response(self, prev_index: int, conflict_term: int) -> AppendEntriesResponse:
+        """Tell the leader where our log first disagrees, so it can skip a whole term at once."""
+        first = prev_index
+        floor = self._store.snapshot_index() + 1
+        while first > floor and self._store.term_at(first - 1) == conflict_term:
+            first -= 1
+        return AppendEntriesResponse(self._term, False, conflict_index=first, conflict_term=conflict_term)
+
+    def _merge_entries(self, prev_index: int, entries: list[LogEntry]) -> None:
+        """Append what is new; truncate only where a stored entry has a different term.
+
+        Entries whose term already matches are skipped, never truncated: a delayed or duplicated
+        AppendEntries must not delete newer entries.
+        """
+        for position, entry in enumerate(entries):
+            existing_term = self._store.term_at(entry.index)
+            if existing_term == entry.term:
+                continue
+            if existing_term is not None:
+                if entry.index <= self._commit_index:
+                    raise RuntimeError(f"leader asks to overwrite committed entry {entry.index}")
+                self._store.truncate_from(entry.index)
+            self._store.append(entries[position:])  # durable before we answer success
+            return
 
     # ------------------------------------------------------------------ InstallSnapshot handler
 
@@ -357,6 +445,10 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._replication_tasks.clear()
         self._replication_kick.clear()
 
+    def _kick_replication(self) -> None:
+        for event in self._replication_kick.values():
+            event.set()
+
     async def _replicate_loop(self, peer: NodeId, term: int) -> None:
         kick = self._replication_kick[peer]
         heartbeat_s = self._config.heartbeat_interval_ms / 1000
@@ -370,8 +462,16 @@ class RaftNode(Consensus, RaftRpcHandler):
             kick.clear()
 
     async def _replicate_once(self, peer: NodeId, term: int) -> bool:
-        """Send one heartbeat (an empty AppendEntries). Log replication arrives in the next step."""
-        request = AppendEntriesRequest(term, self.node_id, 0, 0, [], 0)
+        """Send one AppendEntries (or InstallSnapshot). True means: go again immediately."""
+        next_index = min(self._next_index[peer], self._store.last_index() + 1)
+        prev_index = next_index - 1
+        prev_term = self._store.term_at(prev_index) or 0
+        last_index = self._store.last_index()
+        entries: list[LogEntry] = []
+        if next_index <= last_index:
+            stop = min(last_index + 1, next_index + self._config.max_entries_per_append)
+            entries = self._store.entries(next_index, stop)
+        request = AppendEntriesRequest(term, self.node_id, prev_index, prev_term, entries, self._commit_index)
         try:
             response = await self._rpc(
                 self._transport.append_entries(peer, request), self._config.rpc_timeout_ms / 1000
@@ -383,8 +483,94 @@ class RaftNode(Consensus, RaftRpcHandler):
         if response.term > self._term:
             self._become_follower(response.term)
             return False
+
         self._ack_time[peer] = self._now()
-        return False
+        if response.success:
+            self._match_index[peer] = max(self._match_index[peer], response.match_index)
+            self._next_index[peer] = self._match_index[peer] + 1
+            self._advance_commit()
+            return self._next_index[peer] <= self._store.last_index()
+
+        self._next_index[peer] = self._backed_up_next_index(peer, next_index, response)
+        return True
+
+    def _backed_up_next_index(self, peer: NodeId, tried: int, response: AppendEntriesResponse) -> int:
+        """Fast backup: jump past our last entry of the follower's conflicting term, else to its hint."""
+        if response.conflict_term:
+            last_of_term = self._last_index_of_term(response.conflict_term)
+            candidate = last_of_term + 1 if last_of_term else response.conflict_index
+        else:
+            candidate = response.conflict_index
+        if candidate <= 0 or candidate >= tried:
+            candidate = tried - 1  # always make progress
+        return max(candidate, self._match_index[peer] + 1, 1)
+
+    def _last_index_of_term(self, term: int) -> int:
+        """Last index in our log whose entry has `term`, or 0 if our log has none."""
+        index = self._store.last_index()
+        floor = self._store.snapshot_index()
+        while index > floor:
+            entry_term = self._store.term_at(index)
+            if entry_term is not None and entry_term <= term:
+                return index if entry_term == term else 0
+            index -= 1
+        return floor if floor and self._store.snapshot_term() == term else 0
+
+    def _advance_commit(self) -> None:
+        """Commit the highest N stored on a majority, but only if entry N is from the current term."""
+        if self._role != LEADER:
+            return
+        stored = sorted(
+            [self._store.last_index()] + [self._match_index[p] for p in self._peers], reverse=True
+        )
+        candidate = stored[self._majority - 1]
+        if candidate > self._commit_index and self._store.term_at(candidate) == self._term:
+            self._set_commit(candidate)
+
+    def _set_commit(self, index: int) -> None:
+        if index <= self._commit_index:
+            return
+        self._commit_index = index
+        self._store.save_commit_index(index)
+        if self._apply_wakeup is not None:
+            self._apply_wakeup.set()
+
+    # ------------------------------------------------------------------ apply loop and snapshots
+
+    async def _apply_loop(self) -> None:
+        assert self._apply_wakeup is not None
+        while True:
+            await self._apply_wakeup.wait()
+            self._apply_wakeup.clear()
+            while self._sm.last_applied() < self._commit_index:
+                self._apply_batch()
+                await asyncio.sleep(0)  # let heartbeats and RPCs run between batches
+
+    def _apply_batch(self) -> None:
+        """Apply up to APPLY_BATCH_SIZE committed entries in index order. Runs without awaiting."""
+        first = self._sm.last_applied() + 1
+        last = min(self._commit_index, first + APPLY_BATCH_SIZE - 1)
+        entries = self._store.entries(first, last + 1)
+        if not entries:
+            raise RuntimeError(f"committed entry {first} is missing from the log")
+        for entry in entries:
+            self._record_result(self._sm.apply(entry))
+
+    def _record_result(self, result: ApplyResult) -> None:
+        self._results[result.index] = result
+        while len(self._results) > RESULT_CACHE_SIZE:
+            self._results.popitem(last=False)
+        for term, future in self._waiters.pop(result.index, []):
+            if future.done():
+                continue
+            if result.term == term:
+                future.set_result(result)
+            else:
+                future.set_exception(
+                    LeadershipLostError(
+                        f"entry {result.index} was committed in term {result.term}, not {term}"
+                    )
+                )
 
 
 def _elapsed_ms(started: float) -> float:

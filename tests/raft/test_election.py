@@ -32,6 +32,18 @@ def test_five_nodes_elect_one_stable_leader(seed):
     run_simulated(_single_leader, 5, seed)
 
 
+def test_single_node_cluster_elects_itself_and_commits():
+    async def scenario():
+        cluster = SimCluster(1, seed=1)
+        await cluster.start()
+        await cluster.wait_for_leader()
+        result = await cluster.propose_and_wait(b"solo")
+        assert result.index >= 2
+        await cluster.stop()
+
+    run_simulated(scenario)
+
+
 async def _reelection(seed: int) -> None:
     cluster = SimCluster(5, seed)
     await cluster.start()
