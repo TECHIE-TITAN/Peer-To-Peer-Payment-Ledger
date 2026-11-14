@@ -1,4 +1,4 @@
-"""RaftNode: leader election, log replication, commit, apply and client futures (owned by P).
+"""RaftNode: election, replication, commit, apply and local-log recovery (owned by P).
 
 Everything runs on one asyncio event loop and never awaits while a critical section is half done:
 store and state-machine calls are synchronous, and the only awaits are transport calls and sleeps.
@@ -127,6 +127,8 @@ class RaftNode(Consensus, RaftRpcHandler):
         await self._transport.start(self)
         self._spawn(self._ticker_loop(), "ticker")
         self._spawn(self._apply_loop(), "applier")
+        if self._commit_index > self._sm.last_applied():
+            self._apply_wakeup.set()
         await asyncio.sleep(0)  # let the background tasks start, so an immediate stop() cancels them cleanly
 
     async def stop(self) -> None:
@@ -192,8 +194,23 @@ class RaftNode(Consensus, RaftRpcHandler):
     # ------------------------------------------------------------------ startup and recovery
 
     def _recover(self) -> None:
-        """Load the persistent term and vote. (Replaying the local log arrives with crash recovery.)"""
+        """Replay the local log up to the persisted commit index, so a restart need not wait for a leader."""
         self._term, self._voted_for = self._store.load_hard_state()
+
+        started = time.monotonic()
+        target = min(self._store.load_commit_index(), self._store.last_index())
+        replayed = 0
+        while self._sm.last_applied() < target:
+            first = self._sm.last_applied() + 1
+            entries = self._store.entries(first, min(target, first + APPLY_BATCH_SIZE - 1) + 1)
+            if not entries:
+                raise RuntimeError(f"local log has no entry at index {first} during replay")
+            for entry in entries:
+                self._record_result(self._sm.apply(entry))
+                replayed += 1
+        self._commit_index = max(target, self._sm.last_applied())
+        events.emit("LOCAL_REPLAY_DONE", applied=replayed, ms=_elapsed_ms(started))
+        self._info("recovered: term=%d commit=%d replayed=%d", self._term, self._commit_index, replayed)
 
     # ------------------------------------------------------------------ small helpers
 
