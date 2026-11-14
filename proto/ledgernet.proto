@@ -1,0 +1,95 @@
+syntax = "proto3";
+package ledgernet;
+
+// ---------------- Raft (node-to-node) ----------------
+message LogEntry { uint64 index = 1; uint64 term = 2; bytes command = 3; }
+
+message RequestVoteRequest {
+  uint64 term = 1; string candidate_id = 2;
+  uint64 last_log_index = 3; uint64 last_log_term = 4; bool pre_vote = 5;
+}
+message RequestVoteResponse { uint64 term = 1; bool vote_granted = 2; }
+
+message AppendEntriesRequest {
+  uint64 term = 1; string leader_id = 2;
+  uint64 prev_log_index = 3; uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5; uint64 leader_commit = 6;
+}
+message AppendEntriesResponse {
+  uint64 term = 1; bool success = 2; uint64 match_index = 3;
+  uint64 conflict_index = 4; uint64 conflict_term = 5;
+}
+
+message InstallSnapshotRequest {
+  uint64 term = 1; string leader_id = 2;
+  uint64 last_included_index = 3; uint64 last_included_term = 4; bytes data = 5;
+}
+message InstallSnapshotResponse { uint64 term = 1; }
+
+service Raft {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// ---------------- Client-facing ----------------
+message SubmitTransferRequest {
+  bytes command = 1;          // 145-byte TRANSFER command (tx.py)
+  bool skip_precheck = 2;     // honoured only if node runs with --unsafe-debug (forged-tx test)
+}
+message SubmitTransferResponse {
+  enum Outcome {
+    COMMITTED = 0;            // see tx_status for the ledger verdict
+    NOT_LEADER = 1;           // retry at leader_address (may be empty)
+    TIMEOUT = 2;              // outcome unknown: check GetReceipt / nonce
+    RETRY = 3;                // entry was overwritten; safe to resubmit the same bytes
+    PRECHECK_FAILED = 4;      // bad format or signature; never entered the log
+  }
+  Outcome outcome = 1;
+  string leader_hint = 2;
+  string leader_address = 3;  // "host:port"
+  uint32 tx_status = 4;       // TxStatus value (types.py)
+  uint64 index = 5;
+  uint64 term = 6;
+  string block_hash = 7;
+}
+
+message GetAccountRequest { bytes pubkey = 1; }
+message GetAccountResponse { uint64 balance = 1; uint64 nonce = 2; uint64 as_of_index = 3; }
+
+message GetReceiptRequest { bytes tx_id = 1; }
+message GetReceiptResponse {
+  bool found = 1; uint64 index = 2; uint64 term = 3; uint32 tx_status = 4; string block_hash = 5;
+}
+
+message GetStatusRequest {}
+message GetStatusResponse {
+  string node_id = 1; string role = 2; uint64 term = 3; string leader_id = 4;
+  uint64 commit_index = 5; uint64 last_applied = 6; uint64 last_log_index = 7;
+  uint64 snapshot_index = 8; string chain_head = 9; string state_hash = 10;
+  uint64 total_balance = 11; uint64 total_supply = 12;
+}
+
+service Ledger {
+  rpc SubmitTransfer(SubmitTransferRequest) returns (SubmitTransferResponse);
+  rpc GetAccount(GetAccountRequest) returns (GetAccountResponse);
+  rpc GetReceipt(GetReceiptRequest) returns (GetReceiptResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+// ---------------- Fault injection ----------------
+message FaultRule {
+  string target = 1;          // peer node id, or "*" for all peers
+  double drop_prob = 2;       // probability an outbound Raft RPC (request or response) is lost
+  uint32 delay_min_ms = 3;
+  uint32 delay_max_ms = 4;
+  bool partitioned = 5;       // all RPCs to target fail
+  double duplicate_prob = 6;  // request sent twice
+}
+message SetFaultsRequest { repeated FaultRule rules = 1; }
+message Empty {}
+
+service Admin {
+  rpc SetFaults(SetFaultsRequest) returns (Empty);
+  rpc ClearFaults(Empty) returns (Empty);
+}

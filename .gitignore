@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+ledgernet/gen/*
+!ledgernet/gen/__init__.py
+data/
+keys/*.key
+results/
+*.egg-info/

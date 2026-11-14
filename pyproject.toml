@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledgernet"
+version = "0.1.0"
+description = "LedgerNet: a Raft-replicated peer-to-peer payment ledger"
+requires-python = ">=3.10"
+# Exact pins keep every node deterministic (implementation.md, Section 12).
+dependencies = [
+    "grpcio",
+    "grpcio-tools",
+    "protobuf",
+    "cryptography==50.0.2",
+    "pyyaml==6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1",
+    "hypothesis==6.170.14",
+    "pandas",
+    "matplotlib",
+    "black==26.10.1",
+    "ruff==0.17.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["ledgernet*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+markers = [
+    "fuzz: long randomized runs, enabled with --run-fuzz or LEDGERNET_FUZZ=1",
+]
+
+[tool.black]
+line-length = 110
+# Frozen contracts are copied verbatim from docs/implementation.md Section 3; never reformat them.
+extend-exclude = "ledgernet/(common|testing)/|tests/contract/"
+
+[tool.ruff]
+line-length = 110
+extend-exclude = ["ledgernet/common", "ledgernet/testing", "tests/contract"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E402"]
