@@ -1,4 +1,4 @@
-"""RaftNode: election, replication, commit, apply and local-log recovery (owned by P).
+"""RaftNode: election, replication, commit, apply, recovery and snapshots (owned by P).
 
 Everything runs on one asyncio event loop and never awaits while a critical section is half done:
 store and state-machine calls are synchronous, and the only awaits are transport calls and sleeps.
@@ -42,6 +42,7 @@ from ledgernet.common.types import (
     NodeId,
     RaftConfig,
     RaftStatus,
+    Snapshot,
 )
 
 FOLLOWER = "follower"
@@ -50,6 +51,7 @@ LEADER = "leader"
 
 APPLY_BATCH_SIZE = 100  # entries applied between yields to the event loop
 RESULT_CACHE_SIZE = 10_000  # recent ApplyResults kept for wait_for_apply
+SNAPSHOT_RPC_TIMEOUT_FACTOR = 5  # InstallSnapshot carries a whole snapshot, so it gets more time
 
 logger = logging.getLogger("ledgernet.raft")
 
@@ -89,6 +91,8 @@ class RaftNode(Consensus, RaftRpcHandler):
         # Counters and failure flag that tests (and V's node.py) can inspect.
         self.stats: dict[str, int] = {
             "elections_started": 0,
+            "snapshots_taken": 0,
+            "snapshots_installed": 0,
         }
         self.fatal_error: BaseException | None = None
 
@@ -194,8 +198,27 @@ class RaftNode(Consensus, RaftRpcHandler):
     # ------------------------------------------------------------------ startup and recovery
 
     def _recover(self) -> None:
-        """Replay the local log up to the persisted commit index, so a restart need not wait for a leader."""
+        """Snapshot + replay: restore the latest snapshot, then replay the local log up to the commit index."""
         self._term, self._voted_for = self._store.load_hard_state()
+
+        started = time.monotonic()
+        snap = self._snapshots.load_latest()
+        if snap is not None:
+            if snap.last_included_index > self._sm.last_applied():
+                self._sm.restore(snap)
+                events.emit(
+                    "STATE_RESTORED",
+                    snapshot_index=snap.last_included_index,
+                    ms=_elapsed_ms(started),
+                )
+            if snap.last_included_index > self._store.snapshot_index():
+                # Crash between saving the snapshot and compacting the log: finish the compaction.
+                self._store.compact_to(snap.last_included_index, snap.last_included_term)
+        if self._store.snapshot_index() > self._sm.last_applied():
+            raise RuntimeError(
+                f"log is compacted to {self._store.snapshot_index()} but the state machine is at "
+                f"{self._sm.last_applied()} and no snapshot covers the gap"
+            )
 
         started = time.monotonic()
         target = min(self._store.load_commit_index(), self._store.last_index())
@@ -444,7 +467,28 @@ class RaftNode(Consensus, RaftRpcHandler):
     # ------------------------------------------------------------------ InstallSnapshot handler
 
     async def on_install_snapshot(self, req: InstallSnapshotRequest) -> InstallSnapshotResponse:
-        raise NotImplementedError("snapshots are added in a later step")
+        if req.term < self._term:
+            return InstallSnapshotResponse(self._term)
+        self._become_follower(req.term, req.leader_id)
+        self._note_leader_contact(req.leader_id)
+        if req.last_included_index <= self._sm.last_applied():
+            return InstallSnapshotResponse(self._term)  # we already have everything it covers
+
+        started = time.monotonic()
+        snap = Snapshot(req.last_included_index, req.last_included_term, req.data)
+        self._snapshots.save(snap)  # durable before the log is trimmed
+        if self._store.term_at(snap.last_included_index) == snap.last_included_term:
+            self._store.compact_to(snap.last_included_index, snap.last_included_term)  # keep the suffix
+        else:
+            if self._store.last_index() > self._store.snapshot_index():
+                self._store.truncate_from(self._store.snapshot_index() + 1)
+            self._store.compact_to(snap.last_included_index, snap.last_included_term)
+        self._sm.restore(snap)
+        self._set_commit(max(self._commit_index, snap.last_included_index))
+        self.stats["snapshots_installed"] += 1
+        self._info("installed snapshot at index %d", snap.last_included_index)
+        events.emit("SNAPSHOT_INSTALLED", index=snap.last_included_index, ms=_elapsed_ms(started))
+        return InstallSnapshotResponse(self._term)
 
     # ------------------------------------------------------------------ leader: replication
 
@@ -481,6 +525,9 @@ class RaftNode(Consensus, RaftRpcHandler):
     async def _replicate_once(self, peer: NodeId, term: int) -> bool:
         """Send one AppendEntries (or InstallSnapshot). True means: go again immediately."""
         next_index = min(self._next_index[peer], self._store.last_index() + 1)
+        if next_index <= self._store.snapshot_index():
+            return await self._send_snapshot(peer, term)
+
         prev_index = next_index - 1
         prev_term = self._store.term_at(prev_index) or 0
         last_index = self._store.last_index()
@@ -533,6 +580,32 @@ class RaftNode(Consensus, RaftRpcHandler):
             index -= 1
         return floor if floor and self._store.snapshot_term() == term else 0
 
+    async def _send_snapshot(self, peer: NodeId, term: int) -> bool:
+        snap = self._snapshots.load_latest()
+        if snap is None or snap.last_included_index < self._store.snapshot_index():
+            self._warn("log is compacted but no usable snapshot exists for %s", peer)
+            return False
+        request = InstallSnapshotRequest(
+            term, self.node_id, snap.last_included_index, snap.last_included_term, snap.data
+        )
+        try:
+            response = await self._rpc(
+                self._transport.install_snapshot(peer, request),
+                SNAPSHOT_RPC_TIMEOUT_FACTOR * self._config.rpc_timeout_ms / 1000,
+            )
+        except TransportError:
+            return False
+        if self._role != LEADER or self._term != term:
+            return False
+        if response.term > self._term:
+            self._become_follower(response.term)
+            return False
+        self._ack_time[peer] = self._now()
+        self._match_index[peer] = max(self._match_index[peer], snap.last_included_index)
+        self._next_index[peer] = self._match_index[peer] + 1
+        self._advance_commit()
+        return True
+
     def _advance_commit(self) -> None:
         """Commit the highest N stored on a majority, but only if entry N is from the current term."""
         if self._role != LEADER:
@@ -572,6 +645,7 @@ class RaftNode(Consensus, RaftRpcHandler):
             raise RuntimeError(f"committed entry {first} is missing from the log")
         for entry in entries:
             self._record_result(self._sm.apply(entry))
+        self._maybe_take_snapshot()
 
     def _record_result(self, result: ApplyResult) -> None:
         self._results[result.index] = result
@@ -588,6 +662,20 @@ class RaftNode(Consensus, RaftRpcHandler):
                         f"entry {result.index} was committed in term {result.term}, not {term}"
                     )
                 )
+
+    def _maybe_take_snapshot(self) -> None:
+        interval = self._config.snapshot_interval
+        if interval <= 0 or self._sm.last_applied() - self._store.snapshot_index() < interval:
+            return
+        started = time.monotonic()
+        snap = self._sm.take_snapshot()
+        self._snapshots.save(snap)  # durable first ...
+        self._store.compact_to(snap.last_included_index, snap.last_included_term)  # ... then trim the log
+        self.stats["snapshots_taken"] += 1
+        self._info("snapshot at index %d (%d bytes)", snap.last_included_index, len(snap.data))
+        events.emit(
+            "SNAPSHOT_TAKEN", index=snap.last_included_index, ms=_elapsed_ms(started), bytes=len(snap.data)
+        )
 
 
 def _elapsed_ms(started: float) -> float:
