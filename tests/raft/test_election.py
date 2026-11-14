@@ -65,3 +65,42 @@ async def _reelection(seed: int) -> None:
 @seeds
 def test_new_leader_after_leader_crash(seed):
     run_simulated(_reelection, seed)
+
+
+def test_no_leader_in_a_minority_of_two():
+    async def scenario():
+        cluster = SimCluster(5, seed=3)
+        await cluster.start()
+        cluster.start_monitor()
+        leader = await cluster.wait_for_leader()
+        survivors = [n for n in cluster.node_ids if n != leader.node_id][:1] + [leader.node_id]
+        for node_id in cluster.node_ids:
+            if node_id not in survivors:
+                await cluster.crash(node_id)
+        await asyncio.sleep(10.0)  # many election timeouts
+        assert cluster.leader() is None, cluster.describe()
+        cluster.check_invariants()
+        await cluster.stop()
+
+    run_simulated(scenario)
+
+
+def test_prevote_keeps_an_isolated_node_from_inflating_its_term():
+    async def scenario():
+        cluster = SimCluster(5, seed=4)
+        await cluster.start()
+        cluster.start_monitor()
+        leader = await cluster.wait_for_leader()
+        term = leader.status().term
+        lonely = next(n for n in cluster.node_ids if n != leader.node_id)
+        cluster.network.isolate(lonely)
+        await asyncio.sleep(10.0)  # it times out over and over, but never starts a real election
+        assert cluster.nodes[lonely].status().term == term
+        cluster.network.heal()
+        await asyncio.sleep(3.0)
+        assert cluster.leader() is leader and leader.status().term == term  # nobody was disrupted
+        await cluster.propose_and_wait(b"after-heal")
+        cluster.check_invariants(full=True)
+        await cluster.stop()
+
+    run_simulated(scenario)

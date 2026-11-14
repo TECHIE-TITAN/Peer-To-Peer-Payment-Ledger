@@ -1,4 +1,4 @@
-"""RaftNode: election, replication, commit, apply, recovery and snapshots (owned by P).
+"""RaftNode: leader election, log replication, commit, apply, recovery, snapshots (owned by P).
 
 Everything runs on one asyncio event loop and never awaits while a critical section is half done:
 store and state-machine calls are synchronous, and the only awaits are transport calls and sleeps.
@@ -108,6 +108,8 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._match_index: dict[NodeId, int] = {}
         self._ack_time: dict[NodeId, float] = {}
         self._election_deadline = 0.0
+        self._last_leader_contact: float | None = None
+        self._contact_seq = 0  # bumped on every valid message from a current leader
 
         # Background machinery.
         self._stopped = True
@@ -310,6 +312,8 @@ class RaftNode(Consensus, RaftRpcHandler):
 
     def _note_leader_contact(self, leader_id: NodeId) -> None:
         self._leader_id = leader_id
+        self._last_leader_contact = self._now()
+        self._contact_seq += 1
         self._reset_election_deadline()
 
     def _become_leader(self) -> None:
@@ -337,16 +341,25 @@ class RaftNode(Consensus, RaftRpcHandler):
         while True:
             await asyncio.sleep(tick_s)
             now = self._now()
-            if (
-                self._role != LEADER
-                and now >= self._election_deadline
-                and (self._election_task is None or self._election_task.done())
+            if self._role == LEADER:
+                if self._config.check_quorum and self._lost_quorum(now):
+                    self._warn("no majority heard within one election timeout; stepping down")
+                    self._become_follower(self._term)
+            elif now >= self._election_deadline and (
+                self._election_task is None or self._election_task.done()
             ):
                 self._election_task = asyncio.ensure_future(self._guard(self._run_election(), "election"))
+
+    def _lost_quorum(self, now: float) -> bool:
+        window = self._config.election_timeout_max_ms / 1000
+        heard = 1 + sum(1 for p in self._peers if now - self._ack_time.get(p, float("-inf")) < window)
+        return heard < self._majority
 
     async def _run_election(self) -> None:
         self.stats["elections_started"] += 1
         self._reset_election_deadline()
+        if self._peers and self._config.pre_vote and not await self._run_pre_vote():
+            return
         if self._role == LEADER or self._stopped:
             return
         self._set_term(self._term + 1, self.node_id)
@@ -360,6 +373,15 @@ class RaftNode(Consensus, RaftRpcHandler):
         won = await self._collect_votes(request, lambda: self._role == CANDIDATE and self._term == term)
         if won and self._role == CANDIDATE and self._term == term and not self._stopped:
             self._become_leader()
+
+    async def _run_pre_vote(self) -> bool:
+        """Probe peers without changing any term; only a pre-vote majority starts a real election."""
+        term = self._term
+        contact_seq = self._contact_seq
+        last_index, last_term = self._last_log()
+        request = RequestVoteRequest(term + 1, self.node_id, last_index, last_term, pre_vote=True)
+        won = await self._collect_votes(request, lambda: self._term == term and self._role != LEADER)
+        return won and self._contact_seq == contact_seq and not self._stopped
 
     async def _collect_votes(self, request: RequestVoteRequest, still_relevant: Callable[[], bool]) -> bool:
         """Ask every peer concurrently; True as soon as a majority (counting ourselves) grants."""
@@ -395,6 +417,9 @@ class RaftNode(Consensus, RaftRpcHandler):
     # ------------------------------------------------------------------ RequestVote handler
 
     async def on_request_vote(self, req: RequestVoteRequest) -> RequestVoteResponse:
+        if req.pre_vote:
+            return self._handle_pre_vote(req)
+
         if req.term > self._term:
             self._become_follower(req.term)
         if req.term < self._term:
@@ -408,6 +433,19 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._reset_election_deadline()
         self._debug("granted vote to %s", req.candidate_id)
         return RequestVoteResponse(self._term, True)
+
+    def _handle_pre_vote(self, req: RequestVoteRequest) -> RequestVoteResponse:
+        """Would we vote for this candidate? Never changes our term, vote or role."""
+        if req.term <= self._term or self._role == LEADER:
+            return RequestVoteResponse(self._term, False)
+        heard_leader_recently = (
+            self._last_leader_contact is not None
+            and self._now() - self._last_leader_contact < self._config.election_timeout_min_ms / 1000
+        )
+        if heard_leader_recently:
+            return RequestVoteResponse(self._term, False)
+        up_to_date = self._log_is_up_to_date(req.last_log_index, req.last_log_term)
+        return RequestVoteResponse(self._term, up_to_date)
 
     # ------------------------------------------------------------------ AppendEntries handler
 
