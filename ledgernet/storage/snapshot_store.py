@@ -80,6 +80,10 @@ class FileSnapshotStore(SnapshotStore):
         found.sort(reverse=True)
         return found
 
+    def indexes(self) -> list[int]:
+        """Indexes of all snapshot files on disk (valid or not), newest first. Used by the auditor."""
+        return [index for index, _ in self._listing()]
+
     def save(self, snap: Snapshot) -> None:
         name = snapshot_file_name(snap.last_included_index)
         final = os.path.join(self._dir, name)

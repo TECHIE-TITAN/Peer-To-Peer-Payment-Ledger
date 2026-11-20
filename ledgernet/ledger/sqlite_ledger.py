@@ -16,6 +16,7 @@ database runs with ``synchronous=OFF``.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import struct
@@ -271,3 +272,27 @@ class SqliteLedger(LedgerStateMachine):
 
     def receipt_count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM receipts").fetchone()[0])
+
+    def iter_receipts(self) -> Iterator[tuple[bytes, ApplyResult]]:
+        """All receipts as ``(tx_id, ApplyResult)``, sorted by tx_id."""
+        for txid, idx, term, status, bh in self._conn.execute(
+            "SELECT tx_id, idx, term, status, block_hash FROM receipts ORDER BY tx_id"
+        ):
+            yield bytes(txid), ApplyResult(idx, term, TxStatus(status), bh)
+
+    def to_reference_snapshot(self) -> Snapshot:
+        """The current state in ``ReferenceLedger``'s snapshot format, so the auditor can cross-check
+        this ledger against the executable specification from any starting point."""
+        data = json.dumps(
+            {
+                "accounts": {pk.hex(): [bal, nonce] for pk, bal, nonce in self.iter_accounts()},
+                "receipts": {
+                    k.hex(): [r.index, r.term, int(r.status), r.block_hash] for k, r in self.iter_receipts()
+                },
+                "last_applied": self._last_applied,
+                "last_term": self._last_term,
+                "head": self._head.hex(),
+            },
+            sort_keys=True,
+        ).encode()
+        return Snapshot(self._last_applied, self._last_term, data)
