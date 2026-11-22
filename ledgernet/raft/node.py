@@ -142,9 +142,14 @@ class RaftNode(Consensus, RaftRpcHandler):
         tasks = list(self._tasks) + list(self._replication_tasks.values())
         if self._election_task is not None:
             tasks.append(self._election_task)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._apply_wakeup is not None:
+            self._apply_wakeup.set()  # let the applier see `_stopped` and exit
+        # Cancel until every task is really gone: on Python 3.10/3.11 asyncio.wait_for can swallow one cancel.
+        pending = {task for task in tasks if not task.done()}
+        while pending:
+            for task in pending:
+                task.cancel()
+            _, pending = await asyncio.wait(pending, timeout=0.05)
         self._tasks.clear()
         self._replication_tasks.clear()
         self._election_task = None
@@ -338,7 +343,7 @@ class RaftNode(Consensus, RaftRpcHandler):
 
     async def _ticker_loop(self) -> None:
         tick_s = max(0.001, min(0.010, self._config.heartbeat_interval_ms / 3000))
-        while True:
+        while not self._stopped:
             await asyncio.sleep(tick_s)
             now = self._now()
             if self._role == LEADER:
@@ -551,7 +556,9 @@ class RaftNode(Consensus, RaftRpcHandler):
     async def _replicate_loop(self, peer: NodeId, term: int) -> None:
         kick = self._replication_kick[peer]
         heartbeat_s = self._config.heartbeat_interval_ms / 1000
-        while self._role == LEADER and self._term == term:
+        # `not self._stopped` matters on Python 3.10/3.11: asyncio.wait_for can swallow a cancellation that
+        # arrives in the same loop iteration as its timeout, and a stopped leader would then loop forever.
+        while not self._stopped and self._role == LEADER and self._term == term:
             if await self._replicate_once(peer, term):
                 continue  # more to send right now
             try:
@@ -667,10 +674,10 @@ class RaftNode(Consensus, RaftRpcHandler):
 
     async def _apply_loop(self) -> None:
         assert self._apply_wakeup is not None
-        while True:
+        while not self._stopped:
             await self._apply_wakeup.wait()
             self._apply_wakeup.clear()
-            while self._sm.last_applied() < self._commit_index:
+            while not self._stopped and self._sm.last_applied() < self._commit_index:
                 self._apply_batch()
                 await asyncio.sleep(0)  # let heartbeats and RPCs run between batches
 
