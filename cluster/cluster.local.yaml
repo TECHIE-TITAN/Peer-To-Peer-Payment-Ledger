@@ -1,0 +1,18 @@
+# Five nodes on one machine. Run from the repo root; paths are relative to it.
+genesis: config/genesis.json
+raft:
+  election_timeout_min_ms: 300
+  election_timeout_max_ms: 600
+  heartbeat_interval_ms: 75
+  rpc_timeout_ms: 200
+  max_entries_per_append: 256
+  snapshot_interval: 1000
+  pre_vote: true
+  check_quorum: true
+submit_timeout_s: 5
+nodes:
+  - { id: n1, host: 127.0.0.1, port: 50051, data_dir: ./data/n1 }
+  - { id: n2, host: 127.0.0.1, port: 50052, data_dir: ./data/n2 }
+  - { id: n3, host: 127.0.0.1, port: 50053, data_dir: ./data/n3 }
+  - { id: n4, host: 127.0.0.1, port: 50054, data_dir: ./data/n4 }
+  - { id: n5, host: 127.0.0.1, port: 50055, data_dir: ./data/n5 }
