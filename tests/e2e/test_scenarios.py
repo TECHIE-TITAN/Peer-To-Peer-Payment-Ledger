@@ -160,10 +160,11 @@ async def test_s8_full_cluster_sigkill_and_restart_recovers_every_committed_tran
 
 
 async def _sender_loop(cluster, wallet, sink, stop, acked):
-    """One account sending 1-rupee transfers in sequence; records the tx_id of every APPLIED one."""
+    """One account sending 1-paise transfers in sequence; records the tx_id of every APPLIED one."""
     nonce = 1
     while not stop.is_set():
-        command = wallet.transfer(sink, RS, nonce)
+        await asyncio.sleep(0.02)  # about 50 transfers per second per account
+        command = wallet.transfer(sink, 1, nonce)
         result = await cluster.client.submit(command, max_attempts=6)
         if result.outcome == COMMITTED:
             if result.tx_status == TxStatus.APPLIED:
@@ -174,6 +175,17 @@ async def _sender_loop(cluster, wallet, sink, stop, acked):
             nonce += 1  # that nonce was taken by an earlier copy of ours
             continue
         await asyncio.sleep(0.1)  # PRECHECK_FAILED cannot happen here; FAILED: try the same bytes again
+
+
+async def _missing_receipts(cluster, node_id, tx_ids, chunk=100):
+    """The tx_ids this node has no receipt for. Looked up in chunks: thousands of simultaneous RPCs on one
+    channel get cancelled, which would be a test artifact, not a lost transfer."""
+    missing = []
+    for start in range(0, len(tx_ids), chunk):
+        batch = tx_ids[start : start + chunk]
+        receipts = await asyncio.gather(*(cluster.client.get_receipt(t, node_id) for t in batch))
+        missing += [t for t, r in zip(batch, receipts) if not r.found]
+    return missing
 
 
 async def test_s2_leader_sigkill_under_load_loses_no_acknowledged_transfer(make_cluster):
@@ -209,11 +221,7 @@ async def test_s2_leader_sigkill_under_load_loses_no_acknowledged_transfer(make_
     assert len(acked) > after_failover
     # Every acknowledged transfer has a receipt on every node, so none was lost in the failover.
     for node_id in cluster.node_ids:
-        receipts = await asyncio.gather(
-            *(cluster.client.get_receipt(txid, node_id) for txid in acked), return_exceptions=True
-        )
-        broken = [r for r in receipts if isinstance(r, BaseException)]
-        assert not broken, f"{node_id}: {len(broken)} receipt lookups failed, e.g. {broken[0]!r}"
-        assert all(r.found for r in receipts), f"{node_id} is missing receipts"
+        missing = await _missing_receipts(cluster, node_id, acked)
+        assert not missing, f"{node_id} lacks receipts for {len(missing)} of {len(acked)} acknowledged"
     supply = sum(balances.values())
     await finish(cluster, supply)

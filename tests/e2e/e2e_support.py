@@ -28,7 +28,7 @@ FAST_RAFT = {
 }
 
 
-@dataclass
+@dataclass(eq=False)  # compare and hash by identity, so wallets can be dict keys
 class Wallet:
     priv: Ed25519PrivateKey
 
