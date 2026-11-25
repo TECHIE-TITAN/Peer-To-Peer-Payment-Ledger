@@ -10,8 +10,8 @@ import pytest
 
 from bench.accounts import bench_key, load_keys, make_bench_accounts
 from bench.loadgen import CSV_COLUMNS, LoadConfig, main, run_loadgen
-from bench.raw_client import COMMITTED, PRECHECK_FAILED, RawLedgerClient
 from bench.stub_server import StubLedgerServicer, start_stub_server
+from ledgernet.client import COMMITTED, PRECHECK_FAILED, LedgerClient
 from ledgernet.common.tx import encode_transfer, public_bytes, sign_transfer, tx_id
 from ledgernet.common.types import TxStatus
 from ledgernet.gen import ledgernet_pb2_grpc as pb_grpc
@@ -92,7 +92,7 @@ async def test_client_follows_not_leader_hint(accounts):
     )
     follower_port = follower.add_insecure_port("127.0.0.1:0")
     await follower.start()
-    client = RawLedgerClient({"n2": f"127.0.0.1:{follower_port}", "n1": leader_addr})
+    client = LedgerClient({"n2": f"127.0.0.1:{follower_port}", "n1": leader_addr})
     try:
         cmd = encode_transfer(sign_transfer(keys[0], public_bytes(keys[1]), 10, 1))
         res = await client.submit(cmd, node="n2")
@@ -116,7 +116,7 @@ async def test_client_follows_not_leader_hint(accounts):
 
 async def test_unreachable_cluster_gives_up(accounts):
     _, keys, _, _ = accounts
-    client = RawLedgerClient({"n1": "127.0.0.1:1"}, rpc_timeout_s=0.2, backoff_initial_s=0.01)
+    client = LedgerClient({"n1": "127.0.0.1:1"}, rpc_timeout_s=0.2, backoff_initial_s=0.01)
     try:
         cmd = encode_transfer(sign_transfer(keys[0], public_bytes(keys[1]), 10, 1))
         res = await client.submit(cmd, max_attempts=3)
