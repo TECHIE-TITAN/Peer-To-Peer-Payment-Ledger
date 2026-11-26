@@ -9,7 +9,8 @@ It hides the three things a caller should not have to think about:
   * ambiguous timeouts: when the server says "outcome unknown" the client looks the transfer up instead of
     guessing (see `_resolve_timeout`).
 
-Nodes are identified by their "host:port" address.
+Nodes are identified by their "host:port" address. If the client is built from a `{name: address}` mapping,
+the names are accepted wherever a node is passed in (`node=`) and are what `SubmitResult` reports back.
 """
 
 from __future__ import annotations
@@ -53,10 +54,12 @@ class LedgerClient:
         backoff_initial_s: float = 0.05,
         backoff_max_s: float = 1.0,
     ) -> None:
-        # A mapping {name: "host:port"} is accepted for convenience; only the addresses matter.
-        addrs = list(addresses.values()) if isinstance(addresses, Mapping) else list(addresses)
+        # A mapping {name: "host:port"} gives nodes friendly names (used for `node=` and in SubmitResult).
+        self._names: dict[str, str] = dict(addresses) if isinstance(addresses, Mapping) else {}
+        addrs = list(self._names.values()) if isinstance(addresses, Mapping) else list(addresses)
         if not addrs:
             raise ValueError("no node addresses given")
+        self._labels = {address: name for name, address in self._names.items()}
         self._nodes: list[str] = list(dict.fromkeys(addrs))
         self._stubs: dict[str, pb_grpc.LedgerStub] = {}
         self._channels: list[grpc.aio.Channel] = []
@@ -92,6 +95,17 @@ class LedgerClient:
             stub = self._stubs[address] = pb_grpc.LedgerStub(channel)
         return stub
 
+    def _address(self, node: str) -> str:
+        """A node given by name or by address -> its address."""
+        return self._names.get(node, node)
+
+    def _label(self, address: str) -> str:
+        """The name of a node if it has one, else its address."""
+        return self._labels.get(address, address)
+
+    def _pick(self, node: str | None) -> str:
+        return self._address(node) if node else (self._leader or self._nodes[0])
+
     def _next_node(self) -> str:
         address = self._nodes[self._rr % len(self._nodes)]
         self._rr += 1
@@ -110,8 +124,8 @@ class LedgerClient:
 
         `node` pins the first node to try (default: the cached leader, else the next one round-robin).
         """
-        target = node or self._leader or self._next_node()
-        result = SubmitResult(outcome=FAILED, node_first=target)
+        target = self._address(node) if node else (self._leader or self._next_node())
+        result = SubmitResult(outcome=FAILED, node_first=self._label(target))
         backoff = self._backoff_initial_s
 
         async def back_off() -> None:
@@ -121,7 +135,7 @@ class LedgerClient:
 
         while result.attempts < max_attempts:
             result.attempts += 1
-            result.node_final = target
+            result.node_final = self._label(target)
             try:
                 resp = await self._stub(target).SubmitTransfer(
                     pb.SubmitTransferRequest(command=command), timeout=self._rpc_timeout_s
@@ -162,6 +176,7 @@ class LedgerClient:
             resolved = await self._resolve_timeout(command, target)
             if resolved is not None:
                 resolved.attempts, resolved.node_first = result.attempts, result.node_first
+                resolved.node_final = self._label(resolved.node_final)
                 return resolved
             await back_off()
         return result
@@ -202,18 +217,20 @@ class LedgerClient:
 
     async def get_account(self, pubkey: bytes, node: str | None = None) -> tuple[int, int]:
         """(balance in paise, last used nonce)."""
-        resp = await self._stub(node or self._leader or self._nodes[0]).GetAccount(
+        resp = await self._stub(self._pick(node)).GetAccount(
             pb.GetAccountRequest(pubkey=pubkey), timeout=self._rpc_timeout_s
         )
         return resp.balance, resp.nonce
 
     async def get_receipt(self, txid: bytes, node: str | None = None) -> pb.GetReceiptResponse:
-        return await self._stub(node or self._leader or self._nodes[0]).GetReceipt(
+        return await self._stub(self._pick(node)).GetReceipt(
             pb.GetReceiptRequest(tx_id=txid), timeout=self._rpc_timeout_s
         )
 
     async def status(self, node: str) -> pb.GetStatusResponse:
-        return await self._stub(node).GetStatus(pb.GetStatusRequest(), timeout=self._rpc_timeout_s)
+        return await self._stub(self._address(node)).GetStatus(
+            pb.GetStatusRequest(), timeout=self._rpc_timeout_s
+        )
 
     async def status_all(self) -> dict[str, pb.GetStatusResponse | None]:
         """GetStatus from every known node concurrently; None for a node that did not answer."""

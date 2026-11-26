@@ -312,3 +312,27 @@ def test_no_addresses_is_an_error():
 def test_a_name_to_address_mapping_is_accepted():
     client = LedgerClient({"n1": "127.0.0.1:1", "n2": "127.0.0.1:2"})
     assert client.addresses == ["127.0.0.1:1", "127.0.0.1:2"]
+
+
+# ---- named nodes (a {name: address} mapping)
+
+
+async def test_named_nodes_are_accepted_and_reported_by_name(servers, wallets):
+    leader = await _serve(wallets, "n1")
+    follower = await _serve(wallets, "n2", leader=False, hint="n1", hint_address=leader.address)
+    servers.extend([leader, follower])
+    names = {"n2": follower.address, "n1": leader.address}
+    async with LedgerClient(names, rpc_timeout_s=2.0, backoff_initial_s=0.01) as client:
+        result = await client.submit(wallets["alice"].transfer(wallets["bob"], 100, 1), node="n2")
+        assert result.outcome == COMMITTED
+        assert (result.node_first, result.node_final, result.attempts) == ("n2", "n1", 2)
+        assert await client.get_account(wallets["bob"].pub, "n1") == (100, 0)
+        assert (await client.status("n2")).role == "follower"
+
+
+async def test_unnamed_nodes_are_reported_by_address(servers, wallets):
+    leader = await _serve(wallets)
+    servers.append(leader)
+    async with _client(leader.address) as client:
+        result = await client.submit(wallets["alice"].transfer(wallets["bob"], 100, 1))
+    assert result.node_first == result.node_final == leader.address
