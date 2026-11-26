@@ -36,7 +36,8 @@ import grpc
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from bench.accounts import load_keys
-from bench.raw_client import COMMITTED, NOT_APPLIED, PRECHECK_FAILED, RawLedgerClient, parse_addresses
+from bench.raw_client import parse_addresses
+from ledgernet.client import COMMITTED, NOT_APPLIED, PRECHECK_FAILED, LedgerClient
 from ledgernet.common.tx import encode_transfer, public_bytes, sign_transfer, tx_id
 from ledgernet.common.types import TxStatus
 from ledgernet.ledger.genesis import load_genesis
@@ -78,7 +79,7 @@ class _Sender:
 @dataclass
 class _Run:
     cfg: LoadConfig
-    client: RawLedgerClient
+    client: LedgerClient
     recipients: list[bytes]
     rng: random.Random
     measure_from: float = 0.0  # time.time() after which rows are kept
@@ -190,7 +191,7 @@ async def run_loadgen(cfg: LoadConfig) -> dict:
         raise ValueError("none of the given keys is funded in genesis")
     if cfg.mode == "closed" and cfg.clients > len(senders):
         raise ValueError(f"{cfg.clients} clients need at least as many accounts (have {len(senders)})")
-    client = RawLedgerClient(cfg.nodes)
+    client = LedgerClient(cfg.nodes)
     run = _Run(cfg, client, sorted(cfg.genesis), random.Random(cfg.seed))
     try:
         nonces = await asyncio.gather(*(client.get_account(s.pub) for s in senders))
