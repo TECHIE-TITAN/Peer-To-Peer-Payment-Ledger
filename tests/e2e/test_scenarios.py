@@ -1,4 +1,4 @@
-"""End-to-end scenarios S1a, S1b, S2, S4, S5 and S8 (docs/implementation.md Section 10) on 5 real processes.
+"""End-to-end scenarios S1a to S9 (docs/implementation.md Section 10) on 5 real processes.
 
 Each ends with `finish()`: convergence, equal hashes, conservation, then A's auditor on every data directory.
 """
@@ -11,7 +11,8 @@ import grpc
 import pytest
 from e2e_support import RS, Wallet, finish
 
-from ledgernet.client import COMMITTED, NOT_APPLIED, PRECHECK_FAILED
+from cluster.launcher import ClusterError
+from ledgernet.client import COMMITTED, FAILED, NOT_APPLIED, PRECHECK_FAILED
 from ledgernet.common.tx import tx_id
 from ledgernet.common.types import TxStatus
 from ledgernet.gen import ledgernet_pb2 as pb
@@ -225,3 +226,150 @@ async def test_s2_leader_sigkill_under_load_loses_no_acknowledged_transfer(make_
         assert not missing, f"{node_id} lacks receipts for {len(missing)} of {len(acked)} acknowledged"
     supply = sum(balances.values())
     await finish(cluster, supply)
+
+
+async def _assert_receipts_everywhere(cluster, acked):
+    for node_id in cluster.node_ids:
+        missing = await _missing_receipts(cluster, node_id, acked)
+        assert not missing, f"{node_id} lacks receipts for {len(missing)} of {len(acked)} acknowledged"
+
+
+# ---- S3: partition with the leader on the minority side
+
+
+async def test_s3_minority_leader_commits_nothing_and_its_entry_is_discarded(make_cluster, people):
+    alice, bob, carol = people["alice"], people["bob"], people["carol"]
+    cluster = await start(make_cluster, people)
+    old = await cluster.wait_for_leader()
+    buddy = next(n for n in cluster.node_ids if n != old)
+    majority = [n for n in cluster.node_ids if n not in (old, buddy)]
+    await cluster.partition([[old, buddy]])
+
+    # The stranded leader cannot reach a quorum: it must not report this transfer as committed.
+    stranded = alice.transfer(carol, 100 * RS, nonce=1)
+    async with grpc.aio.insecure_channel(cluster.address(old)) as channel:
+        response = await pb_grpc.LedgerStub(channel).SubmitTransfer(
+            pb.SubmitTransferRequest(command=stranded), timeout=15
+        )
+    assert response.outcome in (pb.SubmitTransferResponse.NOT_LEADER, pb.SubmitTransferResponse.TIMEOUT)
+
+    # The majority elects a new leader and carries on; the same nonce is spent there on a different transfer.
+    new = await cluster.wait_for_leader(exclude=[old, buddy])
+    assert new in majority
+    won = await cluster.client.submit(alice.transfer(bob, 100 * RS, nonce=1), node=majority[0])
+    assert (won.outcome, won.tx_status) == (COMMITTED, TxStatus.APPLIED)
+    statuses = await cluster.statuses()
+    assert statuses[old].commit_index < statuses[new].commit_index  # the minority committed nothing
+    assert await cluster.client.get_account(alice.pub, old) == (RS_500, 0)
+
+    await cluster.heal()
+    await cluster.wait_converged()
+    for node_id in cluster.node_ids:  # the stranded entry was overwritten everywhere
+        assert await cluster.client.get_account(alice.pub, node_id) == (RS_500 - 100 * RS, 1)
+        assert await balance(cluster, bob, node_id) == 100 * RS
+        assert await balance(cluster, carol, node_id) == 0
+    await finish(cluster, RS_500)
+
+
+# ---- S6: message loss, delay and duplication
+
+
+async def test_s6_lossy_slow_duplicating_network_loses_nothing(make_cluster):
+    senders = [Wallet.new() for _ in range(6)]
+    sink = Wallet.new()
+    balances = {w: 1_000 * RS for w in senders}
+    balances[sink] = 0
+    slower = {
+        "election_timeout_min_ms": 300,
+        "election_timeout_max_ms": 600,
+        "heartbeat_interval_ms": 50,
+        "rpc_timeout_ms": 300,
+    }
+    cluster = await make_cluster(balances, raft=slower)
+    await cluster.wait_for_leader()
+    rule = pb.FaultRule(target="*", drop_prob=0.2, delay_min_ms=0, delay_max_ms=100, duplicate_prob=0.05)
+    for node_id in cluster.node_ids:
+        await cluster.set_faults(node_id, [rule])
+
+    stop, acked = asyncio.Event(), []
+    loops = [asyncio.create_task(_sender_loop(cluster, w, sink, stop, acked)) for w in senders]
+    try:
+        await asyncio.sleep(12)
+    finally:
+        stop.set()
+        await asyncio.gather(*loops, return_exceptions=True)
+    assert len(acked) > 10, "almost nothing committed through the faulty network"
+
+    await cluster.heal()
+    await cluster.wait_converged(timeout=60)
+    await _assert_receipts_everywhere(cluster, acked)
+    await finish(cluster, sum(balances.values()))
+
+
+# ---- S7: no quorum, no commits
+
+
+async def test_s7_two_nodes_alive_commit_nothing_until_a_third_returns(make_cluster, people):
+    alice, bob = people["alice"], people["bob"]
+    cluster = await start(make_cluster, people)
+    leader = await cluster.wait_for_leader()
+    followers = [n for n in cluster.node_ids if n != leader]
+    for node_id in followers[:2]:
+        cluster.kill(node_id)  # 3 of 5 alive: still a quorum
+    for nonce in range(1, 6):
+        assert (await cluster.client.submit(alice.transfer(bob, RS, nonce))).tx_status == TxStatus.APPLIED
+    alive = [leader, *followers[2:]]
+    before = await cluster.wait_converged(nodes=alive)
+    commit_before = max(s.commit_index for s in before.values())
+
+    cluster.kill(leader)  # 2 of 5 alive: no quorum
+    stuck = alice.transfer(bob, RS, nonce=6)
+    result = await cluster.client.submit(stuck, max_attempts=3)
+    assert result.outcome == FAILED
+    with pytest.raises(ClusterError):
+        await cluster.wait_for_leader(timeout=3)
+    statuses = await cluster.statuses()
+    assert {s.commit_index for s in statuses.values()} == {commit_before}
+
+    await cluster.start(followers[0])  # 3 alive again: a leader appears and the stuck transfer goes through
+    await cluster.wait_for_leader()
+    again = await cluster.client.submit(stuck)
+    assert (again.outcome, again.tx_status) == (COMMITTED, TxStatus.APPLIED)
+    await cluster.start(followers[1])
+    await cluster.start(leader)
+    await cluster.wait_converged()
+    for node_id in cluster.node_ids:  # all five acknowledged transfers and the sixth are everywhere
+        assert await cluster.client.get_account(alice.pub, node_id) == (RS_500 - 6 * RS, 6)
+        assert await balance(cluster, bob, node_id) == 6 * RS
+    await finish(cluster, RS_500)
+
+
+# ---- S9: a follower far behind is brought up by InstallSnapshot
+
+
+async def test_s9_follower_far_behind_receives_a_snapshot(make_cluster):
+    senders = [Wallet.new() for _ in range(10)]
+    sink = Wallet.new()
+    balances = {w: 1_000 * RS for w in senders}
+    balances[sink] = 0
+    cluster = await make_cluster(balances, raft={"snapshot_interval": 500})
+    leader = await cluster.wait_for_leader()
+    victim = next(n for n in cluster.node_ids if n != leader)
+    cluster.kill(victim)
+
+    async def burst(wallet):
+        for nonce in range(1, 301):  # 10 senders x 300 = 3000 entries while the victim is away
+            result = await cluster.client.submit(wallet.transfer(sink, RS, nonce))
+            assert (result.outcome, result.tx_status) == (COMMITTED, TxStatus.APPLIED)
+
+    await asyncio.gather(*(burst(w) for w in senders))
+    await cluster.start(victim)
+    await cluster.wait_converged(timeout=90)
+
+    events = cluster.collect_events()
+    assert any(e["event"] == "SNAPSHOT_TAKEN" for e in events), "the leader never took a snapshot"
+    assert any(
+        e["event"] == "SNAPSHOT_INSTALLED" and e["node"] == victim for e in events
+    ), f"{victim} caught up without receiving a snapshot"
+    assert await balance(cluster, sink, victim) == 3000 * RS
+    await finish(cluster, sum(balances.values()))
