@@ -97,9 +97,10 @@ async def _send_one(run: _Run, sender: _Sender) -> None:
     cmd = encode_transfer(sign_transfer(sender.key, recipient, amount, nonce))
 
     send_ts = time.time()
-    t0 = time.monotonic()
+    # perf_counter, not monotonic: on Windows monotonic ticks every ~15.6 ms, which would quantize latencies.
+    t0 = time.perf_counter()
     res = await run.client.submit(cmd, max_attempts=run.cfg.max_attempts)
-    latency_ms = (time.monotonic() - t0) * 1000.0
+    latency_ms = (time.perf_counter() - t0) * 1000.0
     recv_ts = send_ts + latency_ms / 1000.0
 
     if res.outcome == COMMITTED and res.tx_status in (TxStatus.APPLIED, TxStatus.REJECTED_INSUFFICIENT_FUNDS):

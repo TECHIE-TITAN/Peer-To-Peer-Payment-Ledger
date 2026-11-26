@@ -61,3 +61,24 @@ def test_leftover_tasks_are_cancelled_when_the_scenario_ends():
 
     run_simulated(scenario)
     assert state["cancelled"]
+
+
+def test_short_sleeps_advance_virtual_time_with_other_tasks_busy():
+    """Regression (Windows): asyncio fires timers due within `_clock_resolution` of now early. With the
+    monotonic clock's ~15.6 ms resolution, two tasks doing 10 ms sleeps kept each other ready and virtual
+    time never left 0, so every Raft test hung. The simulated loop must use an exact resolution."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        assert loop._clock_resolution < 1e-6
+
+        async def ticker():
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+
+        await asyncio.gather(ticker(), ticker())
+        return loop.time()
+
+    wall_started = time.monotonic()
+    assert abs(run_simulated(scenario) - 1.0) < 1e-6
+    assert time.monotonic() - wall_started < 2.0

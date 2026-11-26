@@ -173,7 +173,15 @@ class Cluster:
         """
         if self.is_running(node_id):
             raise ClusterError(f"stop {node_id} before wiping it")
-        shutil.rmtree(self.data_dir(node_id), ignore_errors=True)
+        path = self.data_dir(node_id)
+        # On Windows a file of a just-exited process (or one an antivirus scanner opened) can stay locked for a
+        # moment, and rmtree then leaves it behind. Retry briefly, and fail loudly instead of half-wiping.
+        for attempt in range(50):
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                return
+            time.sleep(0.05 * min(attempt + 1, 4))
+        shutil.rmtree(path)  # raises with the real reason
 
     async def close(self) -> None:
         """Stop every node and release connections. Safe to call twice."""

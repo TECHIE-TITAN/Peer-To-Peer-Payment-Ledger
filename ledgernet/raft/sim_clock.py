@@ -17,6 +17,10 @@ class SimulatedTimeLoop(asyncio.SelectorEventLoop):
     def __init__(self) -> None:
         super().__init__()
         self._virtual_now = 0.0
+        # asyncio treats timers due within `_clock_resolution` of now as already due. On Windows that is the
+        # monotonic clock's ~15.6 ms, so 10 ms sleeps would fire without virtual time ever moving forward and
+        # the loop would spin at t = 0. The virtual clock is exact, so its resolution is effectively zero.
+        self._clock_resolution = 1e-9
         real_select = self._selector.select
 
         def select(timeout=None):
