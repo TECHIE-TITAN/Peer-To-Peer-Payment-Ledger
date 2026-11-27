@@ -216,6 +216,29 @@ async def test_dead_node_is_skipped(servers, wallets):
     assert result.node_final == leader.address
 
 
+async def test_unpinned_reads_fall_back_when_the_first_node_is_dead(servers, wallets):
+    node = await _serve(wallets)
+    servers.append(node)
+    async with _client(_free_address(), node.address) as client:  # the dead one is tried first
+        assert await client.get_account(wallets["alice"].pub) == (RS_500, 0)
+        assert (await client.get_receipt(b"\x00" * 32)).found is False
+
+
+async def test_a_pinned_read_does_not_fall_back(servers, wallets):
+    node = await _serve(wallets)
+    servers.append(node)
+    dead = _free_address()
+    async with _client(dead, node.address) as client:
+        with pytest.raises(grpc.aio.AioRpcError):
+            await client.get_account(wallets["alice"].pub, node=dead)
+
+
+async def test_a_read_with_every_node_down_raises(wallets):
+    async with _client(_free_address(), _free_address()) as client:
+        with pytest.raises(grpc.aio.AioRpcError):
+            await client.get_account(wallets["alice"].pub)
+
+
 async def test_all_nodes_down_gives_up_with_failed(wallets):
     async with _client(_free_address(), _free_address()) as client:
         result = await client.submit(wallets["alice"].transfer(wallets["bob"], 100, 1), max_attempts=3)

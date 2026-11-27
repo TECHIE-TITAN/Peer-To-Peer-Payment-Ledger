@@ -67,6 +67,8 @@ class LoadConfig:
     max_attempts: int = 10
     platform: str = "laptop"
     drain_timeout_s: float = 10.0
+    backoff_initial_s: float = 0.05  # LedgerClient retry backoff; small values make failover timing finer
+    backoff_max_s: float = 1.0
 
 
 @dataclass
@@ -192,7 +194,7 @@ async def run_loadgen(cfg: LoadConfig) -> dict:
         raise ValueError("none of the given keys is funded in genesis")
     if cfg.mode == "closed" and cfg.clients > len(senders):
         raise ValueError(f"{cfg.clients} clients need at least as many accounts (have {len(senders)})")
-    client = LedgerClient(cfg.nodes)
+    client = LedgerClient(cfg.nodes, backoff_initial_s=cfg.backoff_initial_s, backoff_max_s=cfg.backoff_max_s)
     run = _Run(cfg, client, sorted(cfg.genesis), random.Random(cfg.seed))
     try:
         nonces = await asyncio.gather(*(client.get_account(s.pub) for s in senders))
@@ -220,6 +222,8 @@ async def run_loadgen(cfg: LoadConfig) -> dict:
         "accounts": len(senders),
         "nodes": cfg.nodes,
         "platform": cfg.platform,
+        "backoff_initial_s": cfg.backoff_initial_s,
+        "backoff_max_s": cfg.backoff_max_s,
         "start_ts": start_ts,
         "end_ts": end_ts,
         "summary": summary,
@@ -282,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--amount-max-paise", type=int, default=100)
     p.add_argument("--platform", choices=["laptop", "rce"], default="laptop")
+    p.add_argument("--backoff-initial-ms", type=float, default=50.0, help="client retry backoff, first step")
+    p.add_argument("--backoff-max-ms", type=float, default=1000.0, help="client retry backoff, ceiling")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
@@ -301,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         amount_max_paise=args.amount_max_paise,
         platform=args.platform,
+        backoff_initial_s=args.backoff_initial_ms / 1000,
+        backoff_max_s=args.backoff_max_ms / 1000,
     )
     summary = asyncio.run(run_loadgen(cfg))
     print(json.dumps(summary, indent=2))
