@@ -193,19 +193,24 @@ async def _cmd_send(args: argparse.Namespace) -> int:
     return 1
 
 
+def format_status_table(statuses: dict) -> str:
+    """The `wallet status` table: one line per node, `None` for a node that did not answer."""
+    lines = [f"{'address':<22} {'node':<5} {'role':<10} {'term':>5} {'commit':>7} {'applied':>8}  state"]
+    for address, s in statuses.items():
+        if s is None:
+            lines.append(f"{address:<22} {'-':<5} {'unreachable':<10}")
+        else:
+            lines.append(
+                f"{address:<22} {s.node_id:<5} {s.role:<10} {s.term:>5} {s.commit_index:>7} "
+                f"{s.last_applied:>8}  {s.state_hash[:12]}"
+            )
+    return "\n".join(lines)
+
+
 async def _cmd_status(args: argparse.Namespace) -> int:
     async with LedgerClient(_node_addresses(args), rpc_timeout_s=args.timeout) as client:
         statuses = await client.status_all()
-    header = f"{'address':<22} {'node':<5} {'role':<10} {'term':>5} {'commit':>7} {'applied':>8}  state"
-    print(header)
-    for address, s in statuses.items():
-        if s is None:
-            print(f"{address:<22} {'-':<5} {'unreachable':<10}")
-            continue
-        print(
-            f"{address:<22} {s.node_id:<5} {s.role:<10} {s.term:>5} {s.commit_index:>7} "
-            f"{s.last_applied:>8}  {s.state_hash[:12]}"
-        )
+    print(format_status_table(statuses))
     return 0 if any(s is not None for s in statuses.values()) else 1
 
 
