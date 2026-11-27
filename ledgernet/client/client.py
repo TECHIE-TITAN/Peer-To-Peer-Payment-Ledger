@@ -103,8 +103,19 @@ class LedgerClient:
         """The name of a node if it has one, else its address."""
         return self._labels.get(address, address)
 
-    def _pick(self, node: str | None) -> str:
-        return self._address(node) if node else (self._leader or self._nodes[0])
+    async def _read(self, call, node: str | None):
+        """Run a read RPC. A pinned node is asked alone. Otherwise the cached leader is tried first, then every
+        other node in turn, so one dead node (often the old leader) does not fail the read."""
+        if node:
+            return await call(self._stub(self._address(node)))
+        first = self._leader or self._nodes[0]
+        error: grpc.aio.AioRpcError | None = None
+        for address in [first, *(a for a in self._nodes if a != first)]:
+            try:
+                return await call(self._stub(address))
+            except grpc.aio.AioRpcError as exc:
+                error = exc
+        raise error  # every node failed: report the last error
 
     def _next_node(self) -> str:
         address = self._nodes[self._rr % len(self._nodes)]
@@ -213,18 +224,19 @@ class LedgerClient:
             return SubmitResult(NOT_APPLIED, node_final=node)
         return None  # may still commit, or never will: resubmitting the same bytes is safe either way
 
-    # ---- reads (served by one node's local state; pass `node` to ask a specific one)
+    # ---- reads (one node's local state; `node` pins the question to that node, with no fallback)
 
     async def get_account(self, pubkey: bytes, node: str | None = None) -> tuple[int, int]:
         """(balance in paise, last used nonce)."""
-        resp = await self._stub(self._pick(node)).GetAccount(
-            pb.GetAccountRequest(pubkey=pubkey), timeout=self._rpc_timeout_s
+        resp = await self._read(
+            lambda stub: stub.GetAccount(pb.GetAccountRequest(pubkey=pubkey), timeout=self._rpc_timeout_s),
+            node,
         )
         return resp.balance, resp.nonce
 
     async def get_receipt(self, txid: bytes, node: str | None = None) -> pb.GetReceiptResponse:
-        return await self._stub(self._pick(node)).GetReceipt(
-            pb.GetReceiptRequest(tx_id=txid), timeout=self._rpc_timeout_s
+        return await self._read(
+            lambda stub: stub.GetReceipt(pb.GetReceiptRequest(tx_id=txid), timeout=self._rpc_timeout_s), node
         )
 
     async def status(self, node: str) -> pb.GetStatusResponse:

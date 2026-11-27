@@ -44,6 +44,14 @@ GRPC_OPTIONS = [
     ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
     ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
 ]
+# Peer channels also cap gRPC's reconnect backoff (default: 1 s growing x1.6 up to 120 s). A peer that was down for a
+# while (a restart replaying a long log) would otherwise go unreached for seconds after it is listening again.
+CHANNEL_OPTIONS = [
+    *GRPC_OPTIONS,
+    ("grpc.initial_reconnect_backoff_ms", 100),
+    ("grpc.min_reconnect_backoff_ms", 100),
+    ("grpc.max_reconnect_backoff_ms", 1000),
+]
 
 
 class GrpcTransport(Transport):
@@ -110,7 +118,7 @@ class GrpcTransport(Transport):
             address = self._peers.get(target)
             if address is None:
                 raise TransportError(f"unknown peer {target}")
-            channel = grpc.aio.insecure_channel(address, options=GRPC_OPTIONS)
+            channel = grpc.aio.insecure_channel(address, options=CHANNEL_OPTIONS)
             self._channels[target] = channel
             stub = self._stubs[target] = pb_grpc.RaftStub(channel)
         return stub
