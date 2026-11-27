@@ -76,6 +76,8 @@ async def one_run(args: argparse.Namespace, run_dir: Path, run_no: int) -> dict:
                     warmup_s=args.warmup,
                     seed=args.seed + run_no,
                     platform=args.platform,
+                    backoff_initial_s=args.backoff_initial_ms / 1000,
+                    backoff_max_s=args.backoff_max_ms / 1000,
                 )
             )
             load_started = time.time()
@@ -121,6 +123,7 @@ async def one_run(args: argparse.Namespace, run_dir: Path, run_no: int) -> dict:
         killed=victim,
         new_leader=new_leader,
         kill_at_s=args.kill_at,
+        client_backoff_ms=f"{args.backoff_initial_ms:g}-{args.backoff_max_ms:g}",
     )
     return {
         "election_ms": (elected_ts - kill_ts) * 1000,
@@ -150,6 +153,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clients", type=int, default=8)
     p.add_argument("--warmup", type=float, default=2.0)
     p.add_argument("--duration", type=float, default=18.0, help="measured seconds after the warm-up")
+    p.add_argument(
+        "--backoff-initial-ms",
+        type=float,
+        default=10.0,
+        help="client retry backoff, first step (equal to the ceiling = a constant retry interval)",
+    )
+    p.add_argument("--backoff-max-ms", type=float, default=10.0, help="client retry backoff ceiling")
     p.add_argument("--kill-at", type=float, default=10.0, help="seconds after the load starts")
     asyncio.run(amain(p.parse_args(argv)))
     return 0
