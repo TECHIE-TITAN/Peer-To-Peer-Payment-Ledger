@@ -9,7 +9,7 @@
         await cluster.wait_converged()
 
 Local mode runs one `python -m ledgernet.node` subprocess per node. Faults go through the Admin service, so
-partitions need no root. SSH mode (RCE) arrives with week 3; asking for it now fails loudly.
+partitions need no root. SSH mode (a cluster of separate machines) is not implemented; asking for it fails loudly.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class Cluster:
         python: str | None = None,
     ) -> None:
         if mode != "local":
-            raise NotImplementedError(f"mode {mode!r}: only 'local' exists so far (ssh arrives in week 3)")
+            raise NotImplementedError(f"mode {mode!r}: only 'local' is implemented (ssh is not)")
         self.config_path = os.path.abspath(config_path)
         self.config: ClusterConfig = load_cluster_config(config_path)
         self.genesis_path = self.config.genesis_path
