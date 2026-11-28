@@ -119,6 +119,12 @@ class RaftNode(Consensus, RaftRpcHandler):
         self._replication_kick: dict[NodeId, asyncio.Event] = {}
         self._apply_wakeup: asyncio.Event | None = None
 
+        # Newest durable snapshot, kept in memory so sending it never re-reads and re-hashes the snapshot file
+        # (FileSnapshotStore.load_latest does both on every call). Refreshed wherever a snapshot is saved.
+        self._snapshot_cache: Snapshot | None = None
+        # Peers whose last InstallSnapshot failed: probe them cheaply before sending a whole snapshot again.
+        self._snapshot_unreachable: set[NodeId] = set()
+
         # Client futures for wait_for_apply.
         self._waiters: dict[int, list[tuple[int, asyncio.Future]]] = {}
         self._results: OrderedDict[int, ApplyResult] = OrderedDict()
@@ -210,6 +216,7 @@ class RaftNode(Consensus, RaftRpcHandler):
 
         started = time.monotonic()
         snap = self._snapshots.load_latest()
+        self._snapshot_cache = snap
         if snap is not None:
             if snap.last_included_index > self._sm.last_applied():
                 self._sm.restore(snap)
@@ -324,6 +331,7 @@ class RaftNode(Consensus, RaftRpcHandler):
     def _become_leader(self) -> None:
         self._set_role(LEADER)
         self._leader_id = self.node_id
+        self._snapshot_unreachable.clear()
         now = self._now()
         last_index = self._store.last_index()
         for peer in self._peers:
@@ -520,6 +528,7 @@ class RaftNode(Consensus, RaftRpcHandler):
         started = time.monotonic()
         snap = Snapshot(req.last_included_index, req.last_included_term, req.data)
         self._snapshots.save(snap)  # durable before the log is trimmed
+        self._snapshot_cache = snap
         if self._store.term_at(snap.last_included_index) == snap.last_included_term:
             self._store.compact_to(snap.last_included_index, snap.last_included_term)  # keep the suffix
         else:
@@ -626,7 +635,9 @@ class RaftNode(Consensus, RaftRpcHandler):
         return floor if floor and self._store.snapshot_term() == term else 0
 
     async def _send_snapshot(self, peer: NodeId, term: int) -> bool:
-        snap = self._snapshots.load_latest()
+        if peer in self._snapshot_unreachable and not await self._probe(peer, term):
+            return False  # still down: do not push a whole snapshot at it
+        snap = self._snapshot_to_send()
         if snap is None or snap.last_included_index < self._store.snapshot_index():
             self._warn("log is compacted but no usable snapshot exists for %s", peer)
             return False
@@ -639,6 +650,40 @@ class RaftNode(Consensus, RaftRpcHandler):
                 SNAPSHOT_RPC_TIMEOUT_FACTOR * self._config.rpc_timeout_ms / 1000,
             )
         except TransportError:
+            self._snapshot_unreachable.add(peer)
+            return False
+        if self._role != LEADER or self._term != term:
+            return False
+        if response.term > self._term:
+            self._become_follower(response.term)
+            return False
+        self._snapshot_unreachable.discard(peer)
+        self._ack_time[peer] = self._now()
+        self._match_index[peer] = max(self._match_index[peer], snap.last_included_index)
+        self._next_index[peer] = self._match_index[peer] + 1
+        self._advance_commit()
+        return True
+
+    def _snapshot_to_send(self) -> Snapshot | None:
+        if self._snapshot_cache is None:
+            self._snapshot_cache = self._snapshots.load_latest()
+        return self._snapshot_cache
+
+    async def _probe(self, peer: NodeId, term: int) -> bool:
+        """Is the peer reachable again? An empty AppendEntries costs bytes, a snapshot costs megabytes."""
+        request = AppendEntriesRequest(
+            term,
+            self.node_id,
+            self._store.snapshot_index(),
+            self._store.snapshot_term(),
+            [],
+            self._commit_index,
+        )
+        try:
+            response = await self._rpc(
+                self._transport.append_entries(peer, request), self._config.rpc_timeout_ms / 1000
+            )
+        except TransportError:
             return False
         if self._role != LEADER or self._term != term:
             return False
@@ -646,9 +691,7 @@ class RaftNode(Consensus, RaftRpcHandler):
             self._become_follower(response.term)
             return False
         self._ack_time[peer] = self._now()
-        self._match_index[peer] = max(self._match_index[peer], snap.last_included_index)
-        self._next_index[peer] = self._match_index[peer] + 1
-        self._advance_commit()
+        self._snapshot_unreachable.discard(peer)
         return True
 
     def _advance_commit(self) -> None:
@@ -715,6 +758,7 @@ class RaftNode(Consensus, RaftRpcHandler):
         started = time.monotonic()
         snap = self._sm.take_snapshot()
         self._snapshots.save(snap)  # durable first ...
+        self._snapshot_cache = snap
         self._store.compact_to(snap.last_included_index, snap.last_included_term)  # ... then trim the log
         self.stats["snapshots_taken"] += 1
         self._info("snapshot at index %d (%d bytes)", snap.last_included_index, len(snap.data))
