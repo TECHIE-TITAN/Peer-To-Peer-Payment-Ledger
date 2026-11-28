@@ -53,6 +53,7 @@ COLUMNS = [
     "catchup_ms",
     "total_ms",
     "platform",
+    "lag_commit_ms",
 ]
 
 
@@ -82,20 +83,22 @@ def phases(cluster: Cluster, victim: str, since: float) -> tuple[float, float, f
     return float(restore), float(replay["ms"]), float(replay["ts"])
 
 
-async def trial(bench: Bench, filler: Filler, lag: int, timeout: float) -> tuple[float, float, float]:
+async def trial(bench: Bench, filler: Filler, lag: int, timeout: float) -> tuple[float, float, float, float]:
     cluster = bench.cluster
     leader = await cluster.wait_for_leader()
     victim = next(n for n in cluster.node_ids if n != leader)
     await cluster.wait_converged(timeout=timeout)
     cluster.kill(victim)
+    began = time.monotonic()
     await filler.run(lag)  # the cluster moves on without it
+    lag_commit_ms = (time.monotonic() - began) * 1000  # commit speed with a follower down
     target = (await cluster.statuses())[leader].commit_index
     restarted = time.time()
     await cluster.start(victim, wait=False)
     done = await wait_applied(cluster.address(victim), target, timeout)
     restore_ms, replay_ms, replay_ts = phases(cluster, victim, restarted)
     catchup_ms = max(0.0, (done - replay_ts) * 1000)
-    return restore_ms, replay_ms, catchup_ms
+    return restore_ms, replay_ms, catchup_ms, lag_commit_ms
 
 
 def append_row(path: Path, row: dict) -> None:
@@ -123,7 +126,9 @@ async def amain(args: argparse.Namespace) -> None:
                     filler = Filler(bench, args.concurrency, args.seed)
                     await filler.run(length)
                     for run_no in range(1, args.runs + 1):
-                        restore, replay, catchup = await trial(bench, filler, args.lag, args.timeout)
+                        restore, replay, catchup, lag_commit = await trial(
+                            bench, filler, args.lag, args.timeout
+                        )
                         row = {
                             "run": run_no,
                             "log_length": length,
@@ -133,11 +138,12 @@ async def amain(args: argparse.Namespace) -> None:
                             "catchup_ms": f"{catchup:.1f}",
                             "total_ms": f"{restore + replay + catchup:.1f}",
                             "platform": args.platform,
+                            "lag_commit_ms": f"{lag_commit:.0f}",
                         }
                         append_row(csv_path, row)
                         log(
                             f"  run {run_no}: restore {restore:.0f} + replay {replay:.0f} + "
-                            f"catch-up {catchup:.0f} = {restore + replay + catchup:.0f} ms"
+                            f"catch-up {catchup:.0f} = {restore + replay + catchup:.0f} ms; lag commit {lag_commit:.0f} ms"
                         )
     log(f"\nanalyse with:  python analysis/recovery.py {csv_path} --out results/figures")
 
