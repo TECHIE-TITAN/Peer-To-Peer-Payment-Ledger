@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -305,6 +307,25 @@ class Cluster:
         return sorted(merged, key=lambda e: e["ts"])
 
 
+def _free_ports(count: int) -> list[int]:
+    """`count` ports nothing is listening on. They come from below Linux's ephemeral range (32768 and up),
+    where other programs' outgoing connections get theirs, so on a busy shared machine nobody takes one
+    between this check and the node binding it."""
+    candidates = list(range(20000, 32000))
+    random.shuffle(candidates)
+    found: list[int] = []
+    for port in candidates:
+        with socket.socket() as sock:
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError:
+                continue
+        found.append(port)
+        if len(found) == count:
+            return found
+    raise ClusterError(f"could not find {count} free ports in 20000-31999")
+
+
 def write_local_config(
     directory: str,
     genesis_path: str,
@@ -318,17 +339,8 @@ def write_local_config(
     Ports default to free ones picked now; data directories live under `directory`. Used by tests that need
     their own cluster; real runs use `cluster/cluster.local.yaml`.
     """
-    import socket
-
     if ports is None:
-        sockets = [socket.socket() for _ in range(n_nodes)]
-        try:
-            for s in sockets:
-                s.bind(("127.0.0.1", 0))
-            ports = [s.getsockname()[1] for s in sockets]
-        finally:
-            for s in sockets:
-                s.close()
+        ports = _free_ports(n_nodes)
     doc = {
         "genesis": genesis_path,
         "raft": raft or {},
